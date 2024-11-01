@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import ray
 from ray import cloudpickle
 from ray._private import storage
-from ray.types import ObjectRef
+from IncrementalRay.python.ray.types import ObjectRef
 from ray.workflow.common import (
     TaskID,
     WorkflowStatus,
