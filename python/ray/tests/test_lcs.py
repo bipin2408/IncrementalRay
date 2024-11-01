@@ -48,22 +48,23 @@ def lcs(X, Y, bleft, bup, bsize, Lleft, Lup, Ldiag):
 
     def l(i, j):
         if i >= 0 and j >= 0:
-            return L[i][j]
+            return L[i][j] #current block
         if i < 0 and j < 0:
-            val = Ldiag[bsize+i][bsize+j] if Ldiag is not None else 0
+            val = Ldiag[bsize+i][bsize+j] if Ldiag is not None else 0 #diagonal block
             logging.info(f"  Using diagonal value at ({i},{j}): {val}")
             return val
         if i < 0:
-            val = Lleft[bsize+i][j] if Lleft is not None else 0
+            val = Lleft[bsize+i][j] if Lleft is not None else 0 #left block
             logging.info(f"  Using left value at ({i},{j}): {val}")
             return val
-        val = Lup[i][bsize+j] if Lup is not None else 0
+        val = Lup[i][bsize+j] if Lup is not None else 0 #up block
         logging.info(f"  Using up value at ({i},{j}): {val}")
         return val
 
     # Following steps build L[m+1][n+1] in bottom up fashion
     # Note: L[i][j] contains length of LCS of X[0..i-1]
     # and Y[0..j-1]
+    #main algo
     for i in range(bsize):
         for j in range(bsize):
             left = bleft*bsize + i
