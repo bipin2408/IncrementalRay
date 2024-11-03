@@ -12,8 +12,8 @@ if not os.path.exists(log_dir):
 
 # S1 = "CLASS"
 # S2 = "LABS"
-S1 = "A"*3000
-S2 = "A"*3000
+S1 = "A"*3
+S2 = "A"*3
 bsize = 100
 
 # Create log filename with dimensions and block size
