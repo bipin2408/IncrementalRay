@@ -29,6 +29,10 @@ from ray.util.tracing.tracing_helper import (
     _tracing_task_invocation,
 )
 
+from ray.workflow import workflow_storage
+from ray.workflow.workflow_storage import get_workflow_storage
+import ray.workflow.common as workflow_common
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,7 +123,10 @@ class RemoteFunction:
         self._runtime_env = parse_runtime_env(self._runtime_env)
         if "runtime_env" in self._default_options:
             self._default_options["runtime_env"] = self._runtime_env
-
+        
+        self._incremental = self._default_options.get("incremental", False)
+        if self._incremental:
+            self._workflow_storage = get_workflow_storage(workflow_id="incremental_workflow")
         self._language = language
         self._is_generator = inspect.isgeneratorfunction(function)
         self._function = function
@@ -465,7 +472,55 @@ class RemoteFunction:
         if self._decorator is not None:
             invocation = self._decorator(invocation)
 
-        return invocation(args, kwargs)
+        if self._incremental:
+            cache_key = self._generate_cache_key(args, kwargs)
+            cached_result = self._get_cached_result(cache_key)
+            if cached_result:
+                return cached_result
+
+        result = invocation(args, kwargs)
+
+        if self._incremental:
+            self._cache_result(cache_key, result)
+
+        return result
+    
+    def _generate_cache_key(self, args, kwargs):
+        import hashlib
+        import pickle
+        import inspect
+
+        function_code = inspect.getsource(self._function)
+        key_data = (
+            self._function.__module__,
+            self._function.__name__,
+            function_code,
+            args,
+            kwargs,
+        )
+        serialized_data = pickle.dumps(key_data)
+        return hashlib.sha256(serialized_data).hexdigest()
+
+    def _get_cached_result(self, cache_key):
+        try:
+            serialized_output = self._workflow_storage.load_task_output(cache_key)
+            # Deserialize the output
+            import pickle
+            output = pickle.loads(serialized_output)
+            # Put the output into the object store and return an ObjectRef
+            return ray.put(output)
+        except Exception:
+            # If output is not found or any error occurs, return None
+            return None
+
+    def _cache_result(self, cache_key, result):
+        # Get the actual result from the ObjectRef
+        output = ray.get(result)
+        # Serialize the output
+        import pickle
+        serialized_output = pickle.dumps(output)
+        # Use the workflow storage to save the output
+        self._workflow_storage.save_task_output(cache_key, serialized_output)
 
     @DeveloperAPI
     def bind(self, *args, **kwargs):

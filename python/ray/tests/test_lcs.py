@@ -12,9 +12,9 @@ if not os.path.exists(log_dir):
 
 # S1 = "CLASS"
 # S2 = "LABS"
-S1 = "A"*3
-S2 = "A"*3
-bsize = 100
+S1 = "A"*30
+S2 = "A"*30
+bsize = 10
 
 # Create log filename with dimensions and block size
 log_filename = f'lcs_{len(S1)}x{len(S2)}_bsize{bsize}.log'
