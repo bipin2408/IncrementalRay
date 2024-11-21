@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import ray
 from ray import cloudpickle
 from ray._private import storage
-from IncrementalRay.python.ray.types import ObjectRef
+from ray.types import ObjectRef
 from ray.workflow.common import (
     TaskID,
     WorkflowStatus,
@@ -59,6 +59,11 @@ DUPLICATE_NAME_COUNTER = "duplicate_name_counter"
 
 @dataclass
 class TaskInspectResult:
+    from ray.workflow.common import (
+        TaskID,
+        WorkflowStatus,
+        WorkflowTaskRuntimeOptions,
+    )
     # The task output checkpoint exists and valid. If this field
     # is set, we do not set all other fields below.
     output_object_valid: bool = False
