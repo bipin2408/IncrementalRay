@@ -95,3 +95,18 @@ The incremental functionality in Ray is implemented in the `remote_function.py` 
 The incremental implementation of the LCS algorithm using Ray demonstrates the power of caching and reusing intermediate results. By recomputing only the necessary blocks when the input changes, we achieve significant performance improvements while maintaining accuracy.
 
 
+Looking at the error and the code, the issue appears to be related to object references becoming invalid when modifying the input data. Let me explain the problem and propose a fix:
+The error occurs because when we modify the input (X_modified), we're creating new Ray object references, but the cache key generation is not properly handling the case where some dependencies (fleft, fup, fdiag) may be None or invalid.
+
+Problem Explanation
+When you cache the results of the lcs function, you're caching the entire result L, which may contain ObjectRefs if any of the inputs (Lleft, Lup, Ldiag) are ObjectRefs. When you retrieve these cached results and pass them into a new Ray task, those ObjectRefs may no longer be valid because they were created in a different session or by a different worker that may have exited.
+In the third run, where you modify the input S1, some blocks require recomputation due to cache misses. However, the adjacent blocks (Lleft, Lup, Ldiag) may still refer to cached results from previous runs, which include ObjectRefs that are no longer valid.
+---
+Solution
+To fix this issue, you should avoid caching any ObjectRefs or any data structures that contain ObjectRefs. Instead, you should ensure that only serializable data (e.g., primitive data types, lists, dictionaries) without ObjectRefs are being cached.
+Here's how you can modify your code to fix the issue:
+Modify the cache to avoid storing ObjectRefs: Ensure that when you cache the result of a task, you do not cache any ObjectRefs. If your result contains ObjectRefs, you should ray.get() them before caching.
+Update the lcs function to return only serializable data: Ensure that the lcs function returns data that does not include any ObjectRefs.
+Update the RemoteFunction class to avoid serializing ObjectRefs: Modify the caching logic in remote_function.py to prevent caching of ObjectRefs.
+
+another challenge why we use a kvstore and not an object store?

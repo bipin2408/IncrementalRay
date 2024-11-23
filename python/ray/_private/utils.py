@@ -1611,6 +1611,11 @@ def get_runtime_env_info(
     `RuntimeEnv` and create a new `ProtoRuntimeEnvInfo`, and serialize it.
     """
     from ray.runtime_env import RuntimeEnvConfig
+    if runtime_env is None:
+        if serialize:
+            return "{}"
+        else:
+            return {}
 
     proto_runtime_env_info = ProtoRuntimeEnvInfo()
 

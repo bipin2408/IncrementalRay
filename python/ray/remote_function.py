@@ -2,6 +2,7 @@ import inspect
 import logging
 import os
 import uuid
+import hashlib
 from functools import wraps
 from threading import Lock
 
@@ -28,11 +29,12 @@ from ray.util.tracing.tracing_helper import (
     _inject_tracing_into_function,
     _tracing_task_invocation,
 )
+from ray.experimental.internal_kv import _internal_kv_initialized, _internal_kv_put, _internal_kv_get, _internal_kv_exists
+import cloudpickle
 
 logger = logging.getLogger(__name__)
 
 
-# Hook to call with (fn, resources, strategy) on each local task submission.
 _task_launch_hook = None
 
 
@@ -120,21 +122,27 @@ class RemoteFunction:
         if "runtime_env" in self._default_options:
             self._default_options["runtime_env"] = self._runtime_env
         self._incremental = self._default_options.get("incremental", False)
-        if self._incremental:
-            from ray.workflow.workflow_storage import get_workflow_storage
-            self._workflow_storage = get_workflow_storage(workflow_id="incremental_workflow")
+        # if self._incremental:
+        #     from ray.workflow.workflow_storage import get_workflow_storage
+        #     self._workflow_storage = get_workflow_storage(workflow_id="incremental_workflow")
         self._language = language
         self._is_generator = inspect.isgeneratorfunction(function)
         self._function = function
         self._function_signature = None
         # Guards trace injection to enforce exactly once semantics
         self._inject_lock = Lock()
+        self._cached_results = {}
+        self._generate_cache_key_lock = Lock()
         self._function_name = function.__module__ + "." + function.__name__
         self._function_descriptor = function_descriptor
         self._is_cross_language = language != Language.PYTHON
         self._decorator = getattr(function, "__ray_invocation_decorator__", None)
         self._last_export_cluster_and_job = None
         self._uuid = uuid.uuid4()
+        self._cache_dir = os.getenv('RAY_CACHE_DIR', 'ray_cache')
+        self._cache_file = os.path.join(self._cache_dir, 'function_cache.pkl')
+        self._cache_namespace = f"cache:{self._function_name}"
+        print(f"[CACHE] Initialized with namespace: {self._cache_namespace}")
 
         # Override task.remote's signature and docstring
         @wraps(function)
@@ -421,42 +429,58 @@ class RemoteFunction:
         # Override enable_task_events to default for actor if not specified (i.e. None)
         enable_task_events = task_options.get("enable_task_events")
 
+        if self._incremental:
+            cache_key = self._generate_cache_key(args, kwargs)
+            if cache_key is not None:
+                cached_result = self._get_cached_result(cache_key)
+                if cached_result:
+                    return cached_result
+
         def invocation(args, kwargs):
             if self._is_cross_language:
                 list_args = cross_language._format_args(worker, args, kwargs)
             elif not args and not kwargs and not self._function_signature:
                 list_args = []
             else:
-                list_args = ray._private.signature.flatten_args(
-                    self._function_signature, args, kwargs
-                )
+                try:
+                    list_args = ray._private.signature.flatten_args(
+                        self._function_signature, args, kwargs
+                    )
+                except Exception:
+                    # If flattening fails due to invalid refs, return None
+                    if self._incremental:
+                        return None
+                    raise
 
             if worker.mode == ray._private.worker.LOCAL_MODE:
-                assert (
-                    not self._is_cross_language
-                ), "Cross language remote function cannot be executed locally."
-            object_refs = worker.core_worker.submit_task(
-                self._language,
-                self._function_descriptor,
-                list_args,
-                name if name is not None else "",
-                num_returns,
-                resources,
-                max_retries,
-                retry_exceptions,
-                retry_exception_allowlist,
-                scheduling_strategy,
-                worker.debugger_breakpoint,
-                serialized_runtime_env_info or "{}",
-                generator_backpressure_num_objects,
-                enable_task_events,
-            )
-            # Reset worker's debug context from the last "remote" command
-            # (which applies only to this .remote call).
+                assert not self._is_cross_language
+
+            try:
+                object_refs = worker.core_worker.submit_task(
+                    self._language,
+                    self._function_descriptor,
+                    list_args,
+                    name if name is not None else "",
+                    num_returns,
+                    resources,
+                    max_retries,
+                    retry_exceptions,
+                    retry_exception_allowlist,
+                    scheduling_strategy,
+                    worker.debugger_breakpoint,
+                    serialized_runtime_env_info or "{}",
+                    generator_backpressure_num_objects,
+                    enable_task_events,
+                )
+            except ValueError as e:
+                if "owner is unknown" in str(e) and self._incremental:
+                    # Signal that we need to recompute dependencies
+                    return None
+                raise e
+
             worker.debugger_breakpoint = b""
+
             if num_returns == STREAMING_GENERATOR_RETURN:
-                # Streaming generator will return a single ref
-                # that is for the generator task.
                 assert len(object_refs) == 1
                 generator_ref = object_refs[0]
                 return ObjectRefGenerator(generator_ref, worker)
@@ -465,118 +489,137 @@ class RemoteFunction:
             elif len(object_refs) > 1:
                 return object_refs
 
+        # Apply decorator if any
         if self._decorator is not None:
             invocation = self._decorator(invocation)
 
+        # Handle caching
         if self._incremental:
             cache_key = self._generate_cache_key(args, kwargs)
-            cached_result = self._get_cached_result(cache_key)
-            if cached_result:
-                return cached_result
+            if cache_key is not None:
+                cached_result = self._get_cached_result(cache_key)
+                if cached_result is not None:
+                    return cached_result
 
+        # Execute task
         result = invocation(args, kwargs)
-
-        if self._incremental:
+        
+        # If invocation returned None, dependencies need to be recomputed
+        if result is None and self._incremental:
+            # Clear dependencies for this block
+            X_ref, Y_ref, bleft, bup, bsize = args[:5]
+            fleft, fup, fdiag = None, None, None
+            
+            # Retry with fresh dependencies
+            new_args = (X_ref, Y_ref, bleft, bup, bsize, fleft, fup, fdiag)
+            return invocation(new_args, kwargs)
+            
+        # Cache valid results
+        if self._incremental and cache_key is not None:
             self._cache_result(cache_key, result)
 
         return result
     
+    
     def _generate_cache_key(self, args, kwargs):
-        import hashlib
-        import pickle
-        import inspect
-        import ray
-        import numpy as np
-
-        X_ref, Y_ref, bleft, bup, bsize = args[:5]
-        
-        X = ray.get(X_ref)
-        Y = ray.get(Y_ref)
-        
-        start_x = bleft * bsize
-        end_x = min(start_x + bsize, len(X))
-        start_y = bup * bsize
-        end_y = min(start_y + bsize, len(Y))
-
-        Lleft, Lup, Ldiag = args[5:8] if len(args) > 5 else (None, None, None)
-        
+        """Generate a cache key based on inputs and dependencies."""
         try:
-            input_data = (
-                X[start_x:end_x],  
-                Y[start_y:end_y],  
-                bleft,
-                bup,
-                bsize
-            )
-            input_hash = hashlib.sha256(pickle.dumps(input_data)).hexdigest()
-
-            dependency_data = []
+            X_ref, Y_ref, bleft, bup, bsize = args[:5]
             
-            if Lleft is not None:
-                Lleft_val = ray.get(Lleft) if isinstance(Lleft, ray._raylet.ObjectRef) else Lleft
-                dependency_data.append(('left', pickle.dumps(
-                    [row[-1] for row in Lleft_val] if Lleft_val else None
-                )))
-                
-            if Lup is not None:
-                Lup_val = ray.get(Lup) if isinstance(Lup, ray._raylet.ObjectRef) else Lup
-                dependency_data.append(('up', pickle.dumps(
-                    Lup_val[-1] if Lup_val else None
-                )))
-                
-            if Ldiag is not None:
-                Ldiag_val = ray.get(Ldiag) if isinstance(Ldiag, ray._raylet.ObjectRef) else Ldiag
-                dependency_data.append(('diag', pickle.dumps(
-                    Ldiag_val[-1][-1] if Ldiag_val else None
-                )))
-
-            deps_hash = hashlib.sha256(pickle.dumps(tuple(dependency_data))).hexdigest()
-            
-            cache_key = f"{input_hash[:16]}_{deps_hash[:16]}"
-            
-            print(f"[CACHE KEY] Generated for block ({bleft},{bup}): {cache_key}")
-            print(f"  - Input hash: {input_hash[:8]} (based on block content)")
-            print(f"  - Deps hash: {deps_hash[:8]} (based on dependencies)")
-            
-            return cache_key
-            
-        except Exception as e:
-            print(f"[CACHE KEY ERROR] Failed to generate key for block ({bleft},{bup}): {e}")
-            fallback_data = (bleft, bup, bsize, X[start_x:end_x], Y[start_y:end_y])
-            return hashlib.sha256(pickle.dumps(fallback_data)).hexdigest()
-
-    def _get_cached_result(self, cache_key):
-        try:
-            if not hasattr(self, '_workflow_storage'):
-                self._workflow_storage = get_workflow_storage(workflow_id="incremental_workflow")
-            
-            serialized_output = self._workflow_storage.load_task_output(cache_key)
-            if serialized_output:
-                print(f"[CACHE HIT] Found cached result for key: {cache_key[:8]}...")  
-                import pickle
-                output = pickle.loads(serialized_output)
-                import ray
-                return ray.put(output)
-            else:
-                print(f"[CACHE MISS] No cached result found for key: {cache_key[:8]}...")
+            # Get input data
+            try:
+                X_data = ray.get(X_ref)
+                Y_data = ray.get(Y_ref)
+            except Exception:
                 return None
+                
+            # Only include relevant block data and boundaries
+            x_block = X_data[bleft*bsize:(bleft+1)*bsize]
+            y_block = Y_data[bup*bsize:(bup+1)*bsize]
+            
+            # Extract boundary values from dependencies
+            boundary_values = []
+            if len(args) > 5:
+                fleft, fup, fdiag = args[5:8]
+                if fleft is not None:
+                    try:
+                        left_boundary = ray.get(fleft)[-1]  # Last row
+                        boundary_values.append(('L', left_boundary))
+                    except Exception:
+                        return None
+                        
+                if fup is not None:
+                    try:
+                        up_boundary = ray.get(fup)[:, -1]  # Last column
+                        boundary_values.append(('U', up_boundary))
+                    except Exception:
+                        return None
+                        
+                if fdiag is not None:
+                    try:
+                        diag_boundary = (ray.get(fdiag)[-1, -1])  # Bottom-right value
+                        boundary_values.append(('D', diag_boundary))
+                    except Exception:
+                        return None
+
+            # Create hash using block data and boundaries
+            hash_input = (
+                str(x_block).encode() + 
+                str(y_block).encode() + 
+                str(boundary_values).encode()
+            )
+            data_hash = hashlib.md5(hash_input).hexdigest()
+            
+            return f"block_{bleft}_{bup}_size_{bsize}_data_{data_hash[:8]}"
+            
         except Exception as e:
-            print(f"[CACHE ERROR] Failed to get cached result: {e}")
+            logger.debug(f"Error generating cache key: {e}")
             return None
 
     def _cache_result(self, cache_key, result):
+        """Cache the result using Ray's internal KV store."""
+        if not _internal_kv_initialized():
+            logger.warning("Ray internal KV store not initialized")
+            return False
+            
+        full_key = self._get_full_cache_key(cache_key)
         try:
-            if not hasattr(self, '_workflow_storage'):
-                self._workflow_storage = get_workflow_storage(workflow_id="incremental_workflow")
-                
-            import ray
-            output = ray.get(result)
-            import pickle
-            serialized_output = pickle.dumps(output)
-            self._workflow_storage.save_task_output(cache_key, serialized_output, exception=None)
-            print(f"[CACHE SAVE] Successfully cached result for key: {cache_key[:8]}...")
+            serialized_result = cloudpickle.dumps(result)
+            _internal_kv_put(full_key.encode(), serialized_result)
+            logger.info(f"Cached result for key: {cache_key}")
+            return True
         except Exception as e:
-            print(f"[CACHE ERROR] Failed to cache result: {e}")
+            logger.error(f"Error saving to KV store: {e}")
+            return False
+
+    def _get_full_cache_key(self, cache_key):
+        """Get the full cache key including namespace and function info."""
+        if not hasattr(self, '_cache_namespace'):
+            self._cache_namespace = f"cache:{self._function.__module__}.{self._function.__name__}"
+        full_key = f"{self._cache_namespace}:{cache_key}"
+        return full_key
+
+
+    def _get_cached_result(self, cache_key):
+        """Get cached result from Ray's internal KV store."""
+        if not _internal_kv_initialized():
+            return None
+            
+        full_key = self._get_full_cache_key(cache_key)
+        try:
+            if not _internal_kv_exists(full_key.encode()):
+                logger.debug(f"Cache miss for key: {cache_key}")
+                return None
+                
+            serialized_result = _internal_kv_get(full_key.encode())
+            if serialized_result is not None:
+                result = cloudpickle.loads(serialized_result)
+                logger.debug(f"Cache hit for key: {cache_key}")
+                return result
+            return None
+        except Exception as e:
+            logger.error(f"Error loading from KV store: {e}")
+            return None
 
     @DeveloperAPI
     def bind(self, *args, **kwargs):
